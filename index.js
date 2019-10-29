@@ -5,9 +5,10 @@
 
 var uid2 = require('uid2');
 var redis = require('redis').createClient;
-var msgpack = require('notepack.io');
+var msgpack = require('msgpack-lite');
 var Adapter = require('socket.io-adapter');
 var debug = require('debug')('socket.io-redis');
+var async = require('async');
 
 /**
  * Module exports.
@@ -49,8 +50,11 @@ function adapter(uri, opts) {
   // opts
   var pub = opts.pubClient;
   var sub = opts.subClient;
+
   var prefix = opts.key || 'socket.io';
-  var requestsTimeout = opts.requestsTimeout || 5000;
+  var subEvent = opts.subEvent || 'messageBuffer';
+  var requestsTimeout = opts.requestsTimeout || 1000;
+  var withChannelMultiplexing = false !== opts.withChannelMultiplexing;
 
   // init clients if needed
   function createClient() {
@@ -81,6 +85,7 @@ function adapter(uri, opts) {
     this.uid = uid;
     this.prefix = prefix;
     this.requestsTimeout = requestsTimeout;
+    this.withChannelMultiplexing = withChannelMultiplexing;
 
     this.channel = prefix + '#' + nsp.name + '#';
     this.requestChannel = prefix + '-request#' + this.nsp.name + '#';
@@ -102,17 +107,11 @@ function adapter(uri, opts) {
 
     var self = this;
 
-    sub.psubscribe(this.channel + '*', function(err){
+    sub.subscribe([this.channel, this.requestChannel, this.responseChannel], function(err){
       if (err) self.emit('error', err);
     });
 
-    sub.on('pmessageBuffer', this.onmessage.bind(this));
-
-    sub.subscribe([this.requestChannel, this.responseChannel], function(err){
-      if (err) self.emit('error', err);
-    });
-
-    sub.on('messageBuffer', this.onrequest.bind(this));
+    sub.on(subEvent, this.onmessage.bind(this));
 
     function onError(err) {
       self.emit('error', err);
@@ -133,22 +132,21 @@ function adapter(uri, opts) {
    * @api private
    */
 
-  Redis.prototype.onmessage = function(pattern, channel, msg){
+  Redis.prototype.onmessage = function(channel, msg){
     channel = channel.toString();
 
-    if (!this.channelMatches(channel, this.channel)) {
+    if (this.channelMatches(channel, this.requestChannel)) {
+      return this.onrequest(channel, msg);
+    } else if (this.channelMatches(channel, this.responseChannel)) {
+      return this.onresponse(channel, msg);
+    } else if (!this.channelMatches(channel, this.channel)) {
       return debug('ignore different channel');
-    }
-
-    var room = channel.slice(this.channel.length, -1);
-    if (room !== '' && !this.rooms.hasOwnProperty(room)) {
-      return debug('ignore unknown room %s', room);
     }
 
     var args = msgpack.decode(msg);
     var packet;
 
-    if (uid === args.shift()) return debug('ignore same uid');
+    if (uid == args.shift()) return debug('ignore same uid');
 
     packet = args[0];
 
@@ -172,14 +170,6 @@ function adapter(uri, opts) {
    */
 
   Redis.prototype.onrequest = function(channel, msg){
-    channel = channel.toString();
-
-    if (this.channelMatches(channel, this.responseChannel)) {
-      return this.onresponse(channel, msg);
-    } else if (!this.channelMatches(channel, this.requestChannel)) {
-      return debug('ignore different channel');
-    }
-
     var self = this;
     var request;
 
@@ -315,16 +305,14 @@ function adapter(uri, opts) {
       return;
     }
 
-    var requestid = response.requestid;
-
-    if (!requestid || !self.requests[requestid]) {
+    if (!response.requestid || !self.requests[response.requestid]) {
       debug('ignoring unknown request');
       return;
     }
 
     debug('received response %j', response);
 
-    var request = self.requests[requestid];
+    var request = self.requests[response.requestid];
 
     switch (request.type) {
 
@@ -338,17 +326,24 @@ function adapter(uri, opts) {
           request.clients[response.clients[i]] = true;
         }
 
+
+        if(request.canSkip && request.clients.length > 0){
+          // clearTimeout(request.timeout);
+          if (request.callback) process.nextTick(request.callback.bind(null, null, Object.keys(request.clients)));
+          delete self.requests[request.requestid];
+          break;
+        }
         if (request.msgCount === request.numsub) {
           clearTimeout(request.timeout);
           if (request.callback) process.nextTick(request.callback.bind(null, null, Object.keys(request.clients)));
-          delete self.requests[requestid];
+          delete self.requests[request.requestid];
         }
         break;
 
       case requestTypes.clientRooms:
         clearTimeout(request.timeout);
         if (request.callback) process.nextTick(request.callback.bind(null, null, response.rooms));
-        delete self.requests[requestid];
+        delete self.requests[request.requestid];
         break;
 
       case requestTypes.allRooms:
@@ -364,7 +359,7 @@ function adapter(uri, opts) {
         if (request.msgCount === request.numsub) {
           clearTimeout(request.timeout);
           if (request.callback) process.nextTick(request.callback.bind(null, null, Object.keys(request.rooms)));
-          delete self.requests[requestid];
+          delete self.requests[request.requestid];
         }
         break;
 
@@ -373,7 +368,7 @@ function adapter(uri, opts) {
       case requestTypes.remoteDisconnect:
         clearTimeout(request.timeout);
         if (request.callback) process.nextTick(request.callback.bind(null, null));
-        delete self.requests[requestid];
+        delete self.requests[request.requestid];
         break;
 
       case requestTypes.customRequest:
@@ -384,7 +379,7 @@ function adapter(uri, opts) {
         if (request.msgCount === request.numsub) {
           clearTimeout(request.timeout);
           if (request.callback) process.nextTick(request.callback.bind(null, null, request.replies));
-          delete self.requests[requestid];
+          delete self.requests[request.requestid];
         }
         break;
 
@@ -406,14 +401,114 @@ function adapter(uri, opts) {
     packet.nsp = this.nsp.name;
     if (!(remote || (opts && opts.flags && opts.flags.local))) {
       var msg = msgpack.encode([uid, packet, opts]);
-      var channel = this.channel;
-      if (opts.rooms && opts.rooms.length === 1) {
-        channel += opts.rooms[0] + '#';
+      if (this.withChannelMultiplexing && opts.rooms && opts.rooms.length === 1) {
+        pub.publish(this.channel + opts.rooms[0] + '#', msg);
+      } else {
+        pub.publish(this.channel, msg);
       }
-      debug('publishing message to channel %s', channel);
-      pub.publish(channel, msg);
     }
     Adapter.prototype.broadcast.call(this, packet, opts);
+  };
+
+  /**
+   * Subscribe client to room messages.
+   *
+   * @param {String} client id
+   * @param {String} room
+   * @param {Function} callback (optional)
+   * @api public
+   */
+
+  Redis.prototype.add = function(id, room, fn){
+    debug('adding %s to %s ', id, room);
+    var self = this;
+    // subscribe only once per room
+    var alreadyHasRoom = this.rooms.hasOwnProperty(room);
+    Adapter.prototype.add.call(this, id, room);
+
+    if (!this.withChannelMultiplexing || alreadyHasRoom) {
+      if (fn) fn(null);
+      return;
+    }
+
+    var channel = this.channel + room + '#';
+
+    function onSubscribe(err) {
+      if (err) {
+        self.emit('error', err);
+        if (fn) fn(err);
+        return;
+      }
+      if (fn) fn(null);
+    }
+
+    sub.subscribe(channel, onSubscribe);
+  };
+
+  /**
+   * Unsubscribe client from room messages.
+   *
+   * @param {String} session id
+   * @param {String} room id
+   * @param {Function} callback (optional)
+   * @api public
+   */
+
+  Redis.prototype.del = function(id, room, fn){
+    debug('removing %s from %s', id, room);
+
+    var self = this;
+    var hasRoom = this.rooms.hasOwnProperty(room);
+    Adapter.prototype.del.call(this, id, room);
+
+    if (this.withChannelMultiplexing && hasRoom && !this.rooms[room]) {
+      var channel = this.channel + room + '#';
+
+      function onUnsubscribe(err) {
+        if (err) {
+          self.emit('error', err);
+          if (fn) fn(err);
+          return;
+        }
+        if (fn) fn(null);
+      }
+
+      sub.unsubscribe(channel, onUnsubscribe);
+    } else {
+      if (fn) process.nextTick(fn.bind(null, null));
+    }
+  };
+
+  /**
+   * Unsubscribe client completely.
+   *
+   * @param {String} client id
+   * @param {Function} callback (optional)
+   * @api public
+   */
+
+  Redis.prototype.delAll = function(id, fn){
+    debug('removing %s from all rooms', id);
+
+    var self = this;
+    var rooms = this.sids[id];
+
+    if (!rooms) {
+      if (fn) process.nextTick(fn.bind(null, null));
+      return;
+    }
+
+    async.each(Object.keys(rooms), function(room, next){
+      self.del(id, room, next);
+    }, function(err){
+      if (err) {
+        self.emit('error', err);
+        if (fn) fn(err);
+        return;
+      }
+      delete self.sids[id];
+      if (fn) fn(null);
+    });
   };
 
   /**
@@ -443,7 +538,6 @@ function adapter(uri, opts) {
       }
 
       numsub = parseInt(numsub[1], 10);
-      debug('waiting for %d responses to "clients" request', numsub);
 
       var request = JSON.stringify({
         requestid : requestid,
@@ -465,6 +559,54 @@ function adapter(uri, opts) {
         clients: {},
         callback: fn,
         timeout: timeout
+      };
+
+      pub.publish(self.requestChannel, request);
+    });
+  };
+
+
+
+  Redis.prototype.clientsSakr = function(rooms, fn){
+    if ('function' == typeof rooms){
+      fn = rooms;
+      rooms = null;
+    }
+
+    rooms = rooms || [];
+
+    var self = this;
+    var requestid = uid2(6);
+
+    pub.send_command('pubsub', ['numsub', self.requestChannel], function(err, numsub){
+      if (err) {
+        self.emit('error', err);
+        if (fn) fn(err);
+        return;
+      }
+
+      numsub = parseInt(numsub[1], 10);
+
+      var request = JSON.stringify({
+        requestid : requestid,
+        type: requestTypes.clients,
+        rooms : rooms
+      });
+
+      // if there is no response for x second, return result
+      // var timeout = setTimeout(function() {
+      //   var request = self.requests[requestid];
+      //   if (fn) process.nextTick(fn.bind(null, new Error('timeout reached while waiting for clients response'), Object.keys(request.clients)));
+      //   delete self.requests[requestid];
+      // }, self.requestsTimeout);
+
+      self.requests[requestid] = {
+        type: requestTypes.clients,
+        numsub: numsub,
+        msgCount: 0,
+        clients: {},
+        callback: fn,
+        canSkip: true
       };
 
       pub.publish(self.requestChannel, request);
@@ -532,7 +674,6 @@ function adapter(uri, opts) {
       }
 
       numsub = parseInt(numsub[1], 10);
-      debug('waiting for %d responses to "allRooms" request', numsub);
 
       var request = JSON.stringify({
         requestid : requestid,
@@ -708,7 +849,6 @@ function adapter(uri, opts) {
       }
 
       numsub = parseInt(numsub[1], 10);
-      debug('waiting for %d responses to "customRequest" request', numsub);
 
       var request = JSON.stringify({
         requestid : requestid,
